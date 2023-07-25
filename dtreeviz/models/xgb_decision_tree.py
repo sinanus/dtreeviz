@@ -4,6 +4,7 @@ from collections import defaultdict
 from typing import List, Mapping
 
 import numpy as np
+import scipy
 
 from dtreeviz.models.shadow_decision_tree import VisualisationNotYetSupportedError
 from dtreeviz.models.shadow_decision_tree import ShadowDecTree
@@ -28,7 +29,8 @@ class ShadowXGBDTree(ShadowDecTree):
                  y_train,
                  feature_names: List[str] = None,
                  target_name: str = None,
-                 class_names: (List[str], Mapping[int, str]) = None
+                 class_names: (List[str], Mapping[int, str]) = None,
+                 perform_node_prediction_using_model_and_data: bool = True
                  ):
         if hasattr(booster, 'get_booster'):
             booster = booster.get_booster() # support XGBClassifier and XGBRegressor
@@ -41,6 +43,7 @@ class ShadowXGBDTree(ShadowDecTree):
         self.config = json.loads(self.booster.save_config())
         self.node_to_samples = None  # lazy initialized
         self.features = None  # lazy initialized
+        self.perform_node_prediction_using_model_and_data = perform_node_prediction_using_model_and_data
 
         super().__init__(booster, X_train, y_train, feature_names, target_name, class_names)
 
@@ -87,6 +90,22 @@ class ShadowXGBDTree(ShadowDecTree):
         self.features = {node: self.get_node_feature(node) for node in nodes}
         return self.features
 
+    def get_node_prediction(self, id):
+        samples = np.array(self.get_node_samples()[id])
+        if len(samples) >0:
+            node_X_data = self.X_train[samples]
+
+            y_pred = self.booster.predict(xgb.DMatrix(node_X_data, feature_names=self.feature_names))
+            if self.is_logitraw_classifier():
+                # custom objective in xgb return raw scores
+                # but xgb api doesn't allow you to set an objective name to anything other than the predefined names. 
+                # hence we set it to logitraw since the output of the prediction is in that format anyway
+                y_pred = np.rint(scipy.stats.logistic.cdf(y_pred)) # CDF of logistic distribution with mean = 0 and s = 1 is equal to sigmoid function (https://en.wikipedia.org/wiki/Logistic_distribution) 
+            y_pred_unique, y_pred_counts = np.unique(y_pred, return_counts=True)
+            return y_pred_unique[np.argmax(y_pred_counts)]
+        
+        return 0
+    
     def get_node_samples(self):
         """
         Return dictionary mapping node id to list of sample indexes considered by
@@ -205,8 +224,11 @@ class ShadowXGBDTree(ShadowDecTree):
     def get_prediction(self, id):
         all_nodes = self.internal + self.leaves
         if self.is_classifier():
-            node_value = [node.n_sample_classes() for node in all_nodes if node.id == id]
-            return np.argmax(node_value[0])
+            if self.perform_node_prediction_using_model_and_data:
+                return self.get_node_prediction(id)
+            else:
+                node_value = [node.n_sample_classes() for node in all_nodes if node.id == id]
+                return np.argmax(node_value[0])
         elif not self.is_classifier():
             node_samples = [node.samples() for node in all_nodes if node.id == id][0]
             return np.mean(self.y_train[node_samples])
@@ -216,6 +238,14 @@ class ShadowXGBDTree(ShadowDecTree):
         if objective_name == "binary" or objective_name == "multi":
             return True
         elif objective_name == "reg":
+            return False
+        return None
+    
+    def is_logitraw_classifier(self):
+        objective_type = self.config["learner"]["objective"]["name"].split(":")[1]
+        if objective_type == "logitraw":
+            return True
+        elif objective_type in ("logistic", "hinge"):
             return False
         return None
 
